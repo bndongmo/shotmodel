@@ -1,4 +1,4 @@
-# Player-Adjusted Shot Prediction Model
+# Player-Adjusted Shot Prediction Model for 2014-15 season
 
 ## Overview
 
