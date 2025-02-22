@@ -1,0 +1,508 @@
+---
+title: "Shot Probability Model"
+output: html_document
+date: "2024-12-30"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+source("functions.R")
+```
+
+## Shot Probability Model
+
+This notebook will aim to develop a shot probability model to capture player strengths and weaknesses. The first step will be to separate shots into zones in 8 ft increments (0-8ft, 8-16ft, 16-24ft, 24+ft) and create player agnostic models to get a general understanding of what influences shot probability. Next we will attempt to augment these models by including player context namely player efficiency and propensity.
+
+## Data
+
+The dataset used is a collection of all shots taken in the 14-15 season. The key features here are shot distance, defender distance, dribbles, touch time, and shot number (how many shots a player shot previously).
+
+```{r}
+nba_shots <- readRDS("nba_shots.rds")
+nba_shots <- nba_shots %>% arrange(GAME_ID, PERIOD, desc(GAME_CLOCK))
+nba_shots$SHOT_ID <- seq_len(nrow(nba_shots)) 
+nba_shots <- nba_shots %>%
+  relocate(SHOT_ID, .before = GAME_ID) %>%
+  arrange(GAME_ID, PERIOD, desc(GAME_CLOCK))
+```
+
+The first thing to stand out is there is at least one shot with a negative touch time and another with touch time above 24 thus we will filter them out.
+
+```{r}
+nba_shots <- nba_shots %>%
+  filter(TOUCH_TIME >= 0, TOUCH_TIME <= 24)
+```
+
+The second issue is the shot clock column where we have 5567 null values. Some of these appear to be end of quarter shots where the shot clock is turned off. In these instances we will place the game clock into the shot clock. The remaining rows will be dropped. 
+
+```{r}
+nba_shots$SHOT_CLOCK = ifelse(is.na(nba_shots$SHOT_CLOCK), as.numeric(nba_shots$GAME_CLOCK) / 60, nba_shots$SHOT_CLOCK)
+nba_shots <- nba_shots %>%
+  filter(SHOT_CLOCK <= 24)
+```
+
+The last issue is that some shots with distance above 23 feet and 9 inches are classed as twos and some shots below 22 feet are classed as threes
+
+```{r}
+nba_shots <- nba_shots %>%
+  filter(PTS_TYPE == 3 | SHOT_DIST < 22.8, PTS_TYPE == 2 | SHOT_DIST >= 22)
+```
+
+### Splitting
+
+We will separate our shots into 3 roughly equally sized sets.
+
+```{r}
+train_shots <- nba_shots[1:41213, ] %>% mutate(set = 'train')
+val_shots <- nba_shots[41214:82426, ] %>% mutate(set = 'val')
+test_shots <- nba_shots[82427:123639, ] %>% mutate(set = 'test')
+nba_shots <- rbind(train_shots, val_shots, test_shots)
+```
+
+## Player Agnostic Model
+
+The first step will be to perform some feature engineering to capture the relationship between predictors and makes in each zone. We will accomplish this by using Box-Cox transformations.
+
+### Initial Features
+
+Function to transform our features
+
+-   DRIBBLES
+
+-   SHOT_DIST
+
+-   CLOSE_DEF_DIST
+
+-   SHOT_CLOCK
+
+-   TOUCH_TIME
+
+-   SHOT_NUMBER
+
+```{r}
+transform_data <- function(new_data, lambdas) {
+  # Apply transformations using the best lambdas
+  transformed_data <- new_data %>%
+    select(SHOT_ID, PERIOD, GAME_CLOCK, SHOT_NUMBER, SHOT_CLOCK, DRIBBLES, TOUCH_TIME, SHOT_DIST, CLOSE_DEF_DIST, FGM) %>%
+    mutate(
+      DRIBBLES = ((DRIBBLES + 1)^lambdas$DRIBBLES - 1) / lambdas$DRIBBLES,
+      SHOT_DIST = ((SHOT_DIST + 1)^lambdas$SHOT_DIST - 1) / lambdas$SHOT_DIST,
+      CLOSE_DEF_DIST = ((CLOSE_DEF_DIST + 1)^lambdas$CLOSE_DEF_DIST - 1) / lambdas$CLOSE_DEF_DIST,
+      SHOT_CLOCK = ((SHOT_CLOCK + 1)^lambdas$SHOT_CLOCK - 1) / lambdas$SHOT_CLOCK,
+      TOUCH_TIME = ((TOUCH_TIME + 1)^lambdas$TOUCH_TIME - 1) / lambdas$TOUCH_TIME,
+      SHOT_NUMBER = ((SHOT_NUMBER + 1)^lambdas$SHOT_NUMBER - 1) / lambdas$SHOT_NUMBER
+    )
+    
+  
+  return(transformed_data)
+}
+```
+
+Function to determine how well a set of transformations fits the data.
+
+```{r}
+# Define the loss function (negative AIC for minimization)
+
+loss_function <- function(lambdas) {
+  names(lambdas) <- c("SHOT_NUMBER", "SHOT_CLOCK", "DRIBBLES", "TOUCH_TIME", "SHOT_DIST", "CLOSE_DEF_DIST")
+  transformed_data <- transform_data(train_shots, as.list(lambdas))
+  
+  
+  # Fit the logistic regression model
+  model <- glm(FGM ~ SHOT_NUMBER + SHOT_CLOCK + DRIBBLES + TOUCH_TIME + SHOT_DIST + CLOSE_DEF_DIST, 
+               data = transformed_data, family = binomial)
+  
+  # Return the negative AIC
+  return(AIC(model))
+}
+```
+
+Use optim to find best transformation.
+
+```{r, echo=FALSE}
+# # Initial lambda values
+# initial_lambdas <- c(
+#   SHOT_NUMBER = 1,
+#   SHOT_CLOCK = 1,
+#   DRIBBLES = 1,
+#   TOUCH_TIME = 1,
+#   SHOT_DIST = 1,
+#   CLOSE_DEF_DIST = 1
+# )
+# 
+# # Optimize 
+# result <- optim(
+#   par = initial_lambdas,
+#   fn = loss_function,
+#   method = "Nelder-Mead",
+# )
+# 
+# # Extract optimal lambdas
+# optimal_lambdas <- result$par
+# names(optimal_lambdas) <- c("SHOT_NUMBER", "SHOT_CLOCK", "DRIBBLES", "TOUCH_TIME", "SHOT_DIST", "CLOSE_DEF_DIST")
+# optimal_lambdas <- as.list(optimal_lambdas)
+
+optimal_lambdas <- c(2.094198, -1.119226, 1.803809, 0.3481417, 0.2858593, -0.05705536)
+names(optimal_lambdas) <- c("SHOT_NUMBER", "SHOT_CLOCK", "DRIBBLES", "TOUCH_TIME", "SHOT_DIST", "CLOSE_DEF_DIST")
+optimal_lambdas <- as.list(optimal_lambdas)
+
+# Print results
+cat("Optimal Lambda Values:\n")
+print(optimal_lambdas)
+```
+
+Now that we have an optimal transformation of features, we can now tune the model with regularization.
+
+```{r}
+train_data <- train_shots %>%
+  transform_data(optimal_lambdas)
+
+val_data <- val_shots %>%
+  transform_data(optimal_lambdas)
+
+train_x <- model.matrix(FGM ~ SHOT_NUMBER + SHOT_CLOCK + DRIBBLES + TOUCH_TIME + SHOT_DIST + CLOSE_DEF_DIST, data = train_data)[, -1]
+val_x <- model.matrix(FGM ~ SHOT_NUMBER + SHOT_CLOCK + DRIBBLES + TOUCH_TIME + SHOT_DIST + CLOSE_DEF_DIST, data = val_data)[, -1]
+
+train_y <- train_data$FGM
+val_y <- val_data$FGM
+```
+
+```{r}
+
+# # Define the parameter grids
+# lambda_grid <- c(0, 10^seq(-3, 2, by = 0.05))
+# alpha_grid <- seq(0, 1, by = 0.05)
+# 
+# # Generate all combinations of alpha and lambda
+# param_grid <- expand.grid(alpha = alpha_grid, lambda = lambda_grid)
+# 
+# # Function to train and evaluate the model
+# evaluate_model <- function(params) {
+#   alpha <- as.numeric(params["alpha"])
+#   lambda <- as.numeric(params["lambda"])
+#   
+#   model <- glmnet(train_x, train_y, alpha = alpha, lambda = lambda, family = "binomial")
+#   val_predictions <- predict(model, newx = val_x, type = "response")
+#   val_log_loss <- log_loss(val_y, val_predictions)
+#   
+#   return(c(alpha = alpha, lambda = lambda, log_loss = val_log_loss))
+# }
+# 
+# # Set up parallel cluster
+# num_cores <- detectCores() - 1  # Leave one core free
+# cl <- makeCluster(num_cores)
+# 
+# # Export required variables and libraries to the workers
+# clusterExport(cl, varlist = c("train_x", "train_y", "val_x", "val_y", "log_loss", "evaluate_model", "param_grid"))
+# clusterEvalQ(cl, library(glmnet))
+# 
+# # Perform parallel computation
+# results <- parLapply(cl, seq_len(nrow(param_grid)), function(i) {
+#   evaluate_model(param_grid[i, ])
+# })
+# 
+# # Stop the cluster
+# stopCluster(cl)
+# 
+# # Convert results to a data frame
+# results_df <- do.call(rbind, results)
+# results_df <- as.data.frame(results_df)
+# 
+# # Find the best parameters
+# best_result <- results_df[which.min(results_df$log_loss), ]
+# best_alpha <- as.numeric(best_result["alpha"])
+# best_lambda <- as.numeric(best_result["lambda"])
+# best_loss <- as.numeric(best_result["log_loss"])
+
+
+```
+
+```{r}
+best_lambda <- 0.004466836 
+best_alpha <- 0
+best_loss <- 0.6567471
+
+
+# Train the final model with best parameters
+best_model <- glmnet(train_x, train_y, alpha = best_alpha, lambda = best_lambda, family = "binomial")
+
+
+
+train_log_loss <- log_loss(train_y, predict(best_model, newx = train_x, type="response"))
+
+# Compute log losses
+train_log_loss_dummy <- log_loss(train_y, mean(train_y))
+val_log_loss_dummy <- log_loss(val_y, mean(train_y))
+
+
+
+all_data <- rbind(train_shots, val_shots, test_shots) %>%
+    transform_data(optimal_lambdas)
+  
+all_x <- model.matrix(FGM ~ SHOT_NUMBER + SHOT_CLOCK + DRIBBLES + TOUCH_TIME + SHOT_DIST + CLOSE_DEF_DIST, data = all_data)[, -1]
+
+
+nba_shots$PRED = predict(best_model, newx = all_x, type='response')
+```
+
+```{r, echo=FALSE}
+cat("Best Lambda", best_lambda, "\n")
+cat("Best Alpha", best_alpha, "\n")
+cat("Train Log Loss", train_log_loss, "\n")
+cat("Val Log Loss", best_loss, "\n")
+cat("Train Log Loss (Dummy):", train_log_loss_dummy, "\n")
+cat("Val Log Loss (Dummy):", val_log_loss_dummy, "\n")
+cat("Improvement on Train Set:", train_log_loss_dummy - train_log_loss, "\n")
+cat("Improvement on Val Set:", val_log_loss_dummy - best_loss, "\n")
+```
+
+### Zoning
+
+One issue with this model is that it doesn't take into account interactions between features and treats each independently severely hampering the flexibility of the model. There are many ways to deal with this, one being training different models on different subsets of the data where features may have different effects.
+
+player_agnostic.R was used to determine optimal splits to separate the data into 8 categories each with their own model. Names have been assigned to each zone.
+
+```{r}
+nba_shots <- nba_shots %>%
+  mutate(zone = case_when(
+    # SHOT_DIST ≤ 7
+    SHOT_DIST <= 7 & TOUCH_TIME <= 1 & SHOT_DIST <= 5 ~ "Restricted Area Quick Shot",
+    SHOT_DIST <= 7 & TOUCH_TIME <= 1 & SHOT_DIST > 5 ~ "Paint Quick Shot",
+    SHOT_DIST <= 7 & TOUCH_TIME > 1  & SHOT_CLOCK <= 2 ~ "Late Clock Interior Setup Shot",
+    SHOT_DIST <= 7 & TOUCH_TIME > 1  & SHOT_CLOCK > 2 ~ "Interior Setup Shot",
+    
+    # SHOT_DIST > 7
+    SHOT_DIST > 7 & CLOSE_DEF_DIST <= 1 & SHOT_CLOCK <= 3 ~ "Late Clock Closely Guarded Jumper",
+    SHOT_DIST > 7 & CLOSE_DEF_DIST <= 1 & SHOT_CLOCK > 3 ~ "Closely Guarded Jumper",
+    SHOT_DIST > 7 & CLOSE_DEF_DIST > 1 & TOUCH_TIME <= 1 ~ "Catch-and-Shoot",
+    SHOT_DIST > 7 & CLOSE_DEF_DIST > 1 & TOUCH_TIME > 1 ~ "Setup Jumper",
+    
+    TRUE ~ "Unknown"  # Default case to catch any missing values
+  )) 
+  
+```
+
+We see that our overall model is not calibrated within these zones.
+
+```{r}
+nba_shots %>% 
+  filter(set == 'val') %>%
+  mutate(res = FGM - PRED) %>%
+  group_by(zone) %>%
+  summarize(shots = n(), res = mean(res))
+```
+
+The following code trains a model on each zone and merges together the predictions. The procedure remains the same as before for the overall model where we find optimal transformations and tuning parameters but this process occurs in each zone separately.
+
+```{r}
+# # Split dataset by zone
+# zone_splits <- nba_shots %>% group_split(zone)
+# 
+# # Initialize storage for zone-wise models and merged shot data
+# zone_models <- list()
+# zone_lambdas <- list()
+# shots <- NULL  # Empty dataframe to store all shots
+# 
+# # Loop through each zone subset and store its model
+# for (split in zone_splits) {
+#   predictions <- add_predictions(split)  # Apply prediction function
+#   
+#   # Store model corresponding to the zone
+#   zone_name <- unique(split$zone)  # Extract the zone name
+#   zone_models[[zone_name]] <- list(model = predictions$model, lambdas = predictions$lambdas) # Store model for this zone
+#   
+#   
+#   # Append shots data
+#   if (is.null(shots)) {
+#     shots <- predictions$shots  # First iteration initializes shots
+#   } else {
+#     shots <- rbind(shots, predictions$shots)
+#   }
+# }
+# 
+# # Reorder shots based on game sequence
+# nba_shots <- shots %>% arrange(GAME_ID, PERIOD, desc(GAME_CLOCK))
+
+nba_shots <- readRDS("nba_shots_with_base_predictions.rds")
+
+```
+
+The model is now better calibrated.
+
+```{r}
+nba_shots %>% 
+  filter(set == 'val') %>%
+  mutate(overall_res = FGM - PRED, zone_res = FGM - PRED_ZONE) %>%
+  group_by(zone) %>%
+  summarize(shots = n(), overall_res = mean(overall_res), zone_res = mean(zone_res))
+```
+
+```{r}
+nba_shots %>% 
+  mutate(set = factor(set, levels = c("train", "val", "test")),  # Ensure correct order
+         overall_res = FGM - PRED,
+         zone_res = FGM - PRED_ZONE) %>%
+  group_by(set) %>%
+  summarize(shots = n(),
+            overall_ll = log_loss(FGM, PRED),
+            zone_ll = log_loss(FGM, PRED_ZONE),
+            .groups = "drop") 
+```
+
+## Player Adjusted
+
+In the previous section, we developed a player-agnostic model that predicted field goal makes based on shot attributes such as shot distance, defender distance, dribbles, and touch time.
+
+However, this model does not account for **player-specific skill differences**. Some players are significantly better or worse than the league average at making certain types of shots. To improve our predictions, we introduce a **player-adjusted model** that incorporates individual player tendencies by using a similarity-based weighting approach.
+
+### Methodology
+
+The player-adjusted model follows these key steps:
+
+1.  **Compute Shot Similarity**
+    -   Each shot is compared to a player’s **past shots** using selected features:
+        -   `SHOT_DIST`, `CLOSE_DEF_DIST`, `DRIBBLES`, `TOUCH_TIME`
+    -   **Gaussian-based similarity scores** weight how closely a new shot matches previous shots.
+2.  **Weight Past Shots Using Optuna-Tuned Parameters**
+    -   We optimize **prior strength (`prior_strength`)** and **feature importance multipliers for similarity calcs (`m1, m2, m3, m4`)** using **Optuna hyperparameter tuning**.
+    -   This helps balance the influence of historical shooting performance.
+3.  **Similarity Adjustment to Penalize Out-of-Profile Shots**
+    -   If a player attempts a shot **unlike their previous ones**, we **penalize** the prediction.
+    -   Example: **DeAndre Jordan attempting a three-pointer**:
+        -   Most of his past shots are **layups and dunks** which he excels at, so they weigh too much on his three-point ability.
+        -   **Penalty applied** → The model prevents high-probability predictions for such shots.
+4.  **Regularization via Box-Cox Transformations**
+    -   To stabilize similarity-based adjustments, we apply a **Box-Cox transformation** on similarity scores.
+    -   This ensures the adjustments **scale appropriately**.
+5.  **Final Model: Regularized Logistic Regression**
+    -   A **logistic regression model** integrates all adjustments and generates final shot probability predictions.
+
+### Implementation
+
+We first **optimize hyperparameters** that control how much past shots influence future predictions.
+
+```{r}
+# py_run_string("
+# import optuna
+# import numpy as np
+# 
+# def objective(trial):
+#     prior_strength = trial.suggest_float('prior_strength', 10, 10000, log=True)
+#     m1 = trial.suggest_float('m1', 0, 2)
+#     m2 = trial.suggest_float('m2', 0, 2)
+#     m3 = trial.suggest_float('m3', 0, 2)
+#     m4 = trial.suggest_float('m4', 0, 2)
+# 
+#     r_predict_shots = r.predict_shots
+#     error = r_predict_shots(
+#         r.scaled_shots_data,
+#         prior_strength,
+#         [m1, m2, m3, m4]
+#     )
+#     return error  
+# 
+# study = optuna.create_study(direction='minimize')
+# study.optimize(objective, timeout=64800)
+# 
+# best_params = study.best_params
+# ")
+```
+
+DRIBBLES and TOUCH_TIME are highly correlated so it makes sense that only one of them ended up being used in optimal similarity computations.
+
+```{r, echo=FALSE}
+best_params <- list(prior_strength = 359.1743941748627, 
+                    m1=1.9335829032722032, 
+                    m2=0.25322603744811045,
+                    m3=0.000305342832254224, 
+                    m4=0.33397383545214837)
+
+cat("Optimal prior:", 359.1743941748627, "shots\n")
+cat("Similarity importances\n")
+cat("SHOT_DIST:", 1.934, "\n")
+cat("CLOSE_DEF_DIST:", 0.253, "\n")
+cat("DRIBBLES:", 0, "\n")
+cat("TOUCH_TIME:", 0.334, "\n")
+
+```
+
+Once we have optimal parameters, we predict **individual players' shooting probabilities** using past shot similarity.
+
+```{r}
+# # Pre-scale the full dataset (excluding test set if necessary)
+# scaled_nba_shots <- scale_features(nba_shots, feature_cols)
+# scaled_shots_data <- scaled_nba_shots$data
+# 
+# 
+# results_list <- list()
+# for (id in unique(scaled_shots_data$player_id)) {
+#   player_shots <- scaled_shots_data %>% filter(player_id == id)
+#   
+#   pspp <- predict_shots_player_predictions(player_shots, id,
+#                                            prior_strength = best_params$prior_strength, 
+#                                            multipliers = c(best_params$m1, best_params$m2, best_params$m3, best_params$m4))
+#   
+#   player_shots$pred <- pspp$predictions
+#   player_shots$avg_similarity <- pspp$avg_similarities
+#   player_shots$rating <- player_shots$pred - player_shots$PRED_ZONE
+# 
+#   results_list[[as.character(id)]] <- player_shots %>% select(SHOT_ID, pred, rating, avg_similarity)
+# }
+# final_results <- nba_shots %>% right_join(bind_rows(results_list), by = 'SHOT_ID')
+final_results <- readRDS("nba_shots_with_player_predictions.rds")
+```
+
+We stabilize similarity-based adjustments by **applying a Box-Cox transformation** and optimizing the lambda parameter.
+
+```{r}
+lambda_seq <- seq(-4, 0, by = 0.1)
+aic_values <- numeric(length(lambda_seq))
+
+for (i in seq_along(lambda_seq)) {
+  lambda <- lambda_seq[i]
+  train_data <- final_results
+  train_data$avg_similarity_trans <- boxcox_transform(train_data$avg_similarity, lambda)
+
+  X_train <- model.matrix(FGM ~ avg_similarity_trans, data = train_data)
+  y_train <- train_data$FGM
+  offset_train <- pmin(logit(train_data$pred), 36)
+
+  model <- glmnet(X_train, y_train, alpha = 0, lambda = 0, family = "binomial", offset = offset_train, intercept=FALSE)
+  sim_pred <- predict(model, newx = X_train, newoffset = offset_train, type = "response")
+  aic_values[i] <- mean(log_loss(y_train, sim_pred))
+}
+
+optimal_lambda <- lambda_seq[which.min(aic_values)]
+optimal_lambda
+```
+
+This was the optimal adjustment using the transformed feature.
+
+```{r}
+final_results <- final_results %>%
+  mutate(
+    similarity_penalty = boxcox_transform(avg_similarity, -1.8) * 0.007372779,
+    sim_adjusted_logit = logit(pred) + similarity_penalty,
+    sim_pred = inv_logit(sim_adjusted_logit)
+  )
+```
+
+Here is a selection of the penalties incurred on a logit scale.
+
+```{r}
+final_results %>% sample_n(10) %>% 
+  select(avg_similarity, similarity_penalty) %>%
+  arrange(avg_similarity)
+```
+
+We compare the **player-agnostic model**, **player-adjusted model**, and **final similarity-adjusted model** using **log loss**.
+
+```{r}
+final_results %>%
+  mutate(set = factor(set, levels = c("train", "val", "test"))) %>%
+  group_by(set) %>%
+  reframe(base_error = mean(log_loss(FGM, PRED_ZONE)), 
+          player_error = mean(log_loss(FGM, pred)), 
+          sim_error = mean(log_loss(FGM, sim_pred))) 
+
+```
