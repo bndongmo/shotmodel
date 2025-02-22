@@ -80,7 +80,9 @@ To improve the accuracy of this model, we introduce **shot zoning**, where shots
 - **Catch-and-Shoot** – Perimeter shots taken immediately upon receiving a pass.
 - **Setup Jumper** – Perimeter shots taken after some setup movement.
 
-Each zone has its own **logistic regression model**, ensuring that feature influences are tailored to different shot types, improving calibration within each category.
+Each zone has its own **logistic regression model** with unique **Box-Cox transformations**, ensuring that feature influences are tailored to different shot types, improving calibration within each category.
+
+The player adjustments are made as follows.
 
 ### 1️⃣ Compute Shot Similarity
 
@@ -90,7 +92,7 @@ Each zone has its own **logistic regression model**, ensuring that feature influ
 
 This similarity determines how much a past shot influences the prediction for a new shot. If a new shot closely resembles previous attempts, those past shots have **greater weight** in influencing the probability calculation. Conversely, **low similarity means past shots contribute less to the new prediction**.
 
-### 2️⃣ Optimize Prior Strength & Feature Weights (Optuna)
+### 2️⃣ Optimize Prior Strength & Similarity Weights (Optuna)
 
 - Hyperparameters **prior_strength** (influence of base probability) and **feature importances** for similarities are optimized using **Optuna**.
 - This balances historical performance influence with league-wide priors.
